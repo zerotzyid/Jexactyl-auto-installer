@@ -126,10 +126,20 @@ spinner_stop(){
     [ "$AUTO" = 1 ] || [ ! -t 1 ] || printf "\r\e[K"
 }
 
-diagnose(){ # human hint based on the log tail
+step_log(){ # log of the current/last step only (older runs and earlier steps are ignored)
+    local n
+    n=$(grep -n '^=== STEP' "$LOG" 2>/dev/null | tail -n1 | cut -d: -f1)
+    if [ -n "$n" ]; then tail -n +"$n" "$LOG"; else tail -n 100 "$LOG" 2>/dev/null; fi
+}
+
+diagnose(){ # human hint based on the end of the current step's log
     local t
-    t=$(tail -n 300 "$LOG" 2>/dev/null)
+    t=$(step_log | tail -n 60)
     case "$t" in
+        *"Job for nginx.service failed"*|*"nginx: [emerg]"*|*"nginx.service failed"*)
+            echo "Nginx could not start. Usually another web server (Apache) or program already uses port 80/443, or the nginx config is invalid. Check: ss -ltnp | grep -E ':(80|443) '  and  nginx -t" ;;
+        *"Job for mariadb.service failed"*|*"mariadb.service failed"*)
+            echo "MariaDB could not start (often a failed upgrade of an older database). Check: journalctl -xeu mariadb | tail -n 30" ;;
         *"conffile prompt"*|*"end of file on stdin"*)
             echo "A package asked a config question while no terminal was attached. Run: dpkg --configure -a --force-confdef --force-confold && apt-get -f install -y  then start the installer again." ;;
         *"Could not get lock"*|*"Unable to acquire the dpkg"*|*"Waiting for cache lock"*)
@@ -166,8 +176,8 @@ write_report(){ # causes clean hint
 
 fail_tail(){
     local causes clean hint
-    causes=$(tail -n 400 "$LOG" 2>/dev/null | grep -E '^(E:|dpkg: error|COMMAND FAILED)|rror:|Challenge failed|Could not|denied' | grep -v '^NOTICE' | awk '!seen[$0]++' | tail -n 6)
-    clean=$(tail -n 300 "$LOG" 2>/dev/null | grep -vE '^(NOTICE:|Selecting previously|Preparing to unpack|Unpacking|Get:|Hit:|Reading |Building |\(Reading database|Setting up|Creating config|Processing triggers)' | grep -v '^[[:space:]]*$' | tail -n 10)
+    causes=$(step_log | tail -n 60 | grep -E '^(E:|dpkg: error|COMMAND FAILED)|rror:|Challenge failed|Could not|denied|failed' | grep -v '^NOTICE' | awk '!seen[$0]++' | tail -n 6)
+    clean=$(step_log | tail -n 40 | grep -vE '^(NOTICE:|Selecting previously|Preparing to unpack|Unpacking|Get:|Hit:|Reading |Building |\(Reading database|Setting up|Creating config|Processing triggers)' | grep -v '^[[:space:]]*$' | tail -n 10)
     hint=$(diagnose)
     write_report "$causes" "$clean" "$hint"
     printf "\n  ${RED}${B}Why it failed${R}\n"
@@ -466,7 +476,28 @@ step_repos(){
     req apt-get update -y
 }
 
+free_ports(){
+    local svc
+    for svc in apache2 httpd; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            echo "Stopping and disabling ${svc} (it uses port 80/443, nginx is needed instead)."
+            systemctl disable --now "$svc" 2>/dev/null || systemctl stop "$svc" 2>/dev/null
+        fi
+    done
+    echo "Listeners on 80/443:"
+    ss -ltnp 2>/dev/null | grep -E ':(80|443)\s' || echo "  none"
+    return 0
+}
+
+nginx_diag(){
+    echo "--- nginx diagnostics ---"
+    nginx -t 2>&1
+    ss -ltnp 2>/dev/null | grep -E ':(80|443)\s'
+    journalctl -u nginx -n 15 --no-pager 2>&1
+}
+
 step_packages(){
+    free_ports
     local pk=("php${PHP_VERSION}" php${PHP_VERSION}-{cli,gd,mysql,pdo,mbstring,tokenizer,bcmath,xml,fpm,curl,zip} \
         mariadb-server nginx tar unzip git redis-server cron acl certbot jq ufw fail2ban dnsutils)
     if ! req apt-get install -y "${pk[@]}"; then
@@ -475,7 +506,11 @@ step_packages(){
         req apt-get install -y "${pk[@]}" || return 1
     fi
     if [ "$F2B_BACKEND" = systemd ]; then apt-get install -y python3-systemd || true; fi
-    systemctl enable --now redis-server "php${PHP_VERSION}-fpm" cron mariadb nginx || return 1
+    systemctl enable --now redis-server "php${PHP_VERSION}-fpm" cron || return 1
+    systemctl enable --now mariadb || { journalctl -u mariadb -n 25 --no-pager; return 1; }
+    free_ports
+    systemctl enable nginx
+    systemctl restart nginx || { nginx_diag; echo "nginx could not start yet, it will be configured in a later step."; }
     return 0
 }
 
@@ -557,6 +592,7 @@ EOF
 }
 
 step_ssl_panel(){
+    free_ports
     req certbot certonly --standalone --non-interactive --agree-tos --no-eff-email -m "$EMAIL" \
         -d "$PANEL_FQDN" --keep-until-expiring \
         --pre-hook "systemctl stop nginx 2>/dev/null || true" \
@@ -636,7 +672,8 @@ NGINX
     sed -i "s|__FQDN__|${PANEL_FQDN}|g; s|__PHP__|${PHP_VERSION}|g" /etc/nginx/sites-available/jexactyl.conf
     ln -sf /etc/nginx/sites-available/jexactyl.conf /etc/nginx/sites-enabled/jexactyl.conf
     req nginx -t || return 1
-    systemctl restart nginx
+    free_ports
+    systemctl restart nginx || { nginx_diag; return 1; }
 }
 
 step_firewall(){
@@ -1218,7 +1255,7 @@ panel_exists(){ [ -f "$PANEL_DIR/.env" ]; }
 collect_panel_inputs(){
     section "Panel details"
     ask PANEL_FQDN "Panel FQDN (panel.example.com)" "" is_fqdn
-    ask EMAIL "Admin email (also used for Let's Encrypt)" "$(default_email "$PANEL_FQDN")" is_email
+    ask EMAIL "Admin email, e.g. yourname@gmail.com (also used for Let's Encrypt)" "$([ "$AUTO_DEF" = 1 ] && default_email "$PANEL_FQDN")" is_email
     ask ADMIN_USER "Admin username" "admin" is_user
     [ -z "$ADMIN_PASS" ] && ADMIN_PASS="$(rand_str 20)"
     DB_PASS="$(rand_str 32)"
@@ -1267,8 +1304,6 @@ plan_card(){
 mode_full(){
     panel_exists && die "Jexactyl already exists in ${PANEL_DIR}. Use 'Add remote node' or the upgrade options."
     existing_check
-    AUTO_DEF=1
-    info "Quick mode: only the panel & node FQDN are needed, everything else is automatic."
     collect_panel_inputs
     collect_node_inputs
     pick_db_name
@@ -1311,7 +1346,7 @@ mode_node_api(){
     ask PANEL_FQDN "Panel FQDN (already installed)" "" is_fqdn
     info "Create an Application API key in the panel: Admin > Application API (Read & Write for Nodes, Locations, Allocations)."
     ask_secret API_KEY "Application API key (ptla_...)" is_apikey
-    ask EMAIL "Email for Let's Encrypt" "$(default_email "$PANEL_FQDN")" is_email
+    ask EMAIL "Email for Let's Encrypt (e.g. yourname@gmail.com)" "$([ "$AUTO_DEF" = 1 ] && default_email "$PANEL_FQDN")" is_email
     section "Node details"
     ask NODE_FQDN "Node FQDN (this server)" "" is_fqdn
     ask PORT_RANGE "Allocation port range" "25565-25600" is_ports
@@ -1332,7 +1367,7 @@ mode_node_api(){
 mode_remote(){
     panel_exists || die "No panel found in ${PANEL_DIR}. Run this on the panel server."
     [ -n "$PANEL_FQDN" ] || PANEL_FQDN=$(grep -E '^APP_URL=' "$PANEL_DIR/.env" 2>/dev/null | sed -E 's#^APP_URL=https?://##' | tr -d '"/ ')
-    ask EMAIL "Email for Let's Encrypt" "$(default_email "${PANEL_FQDN:-panel.local}")" is_email
+    ask EMAIL "Email for Let's Encrypt (e.g. yourname@gmail.com)" "$([ "$AUTO_DEF" = 1 ] && default_email "${PANEL_FQDN:-panel.local}")" is_email
     ask PORT_RANGE "Allocation port range" "25565-25600" is_ports
     if [ ${#REMOTE_SPECS[@]} -gt 0 ]; then deploy_remote_auto; else deploy_remote_nodes; fi
     run_flow "Finalizing permissions|step_finalize"
