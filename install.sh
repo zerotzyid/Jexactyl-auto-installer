@@ -2,9 +2,7 @@
 # ==============================================================================
 #  Jexactyl Auto Installer  -  one-shot Panel + Node setup
 #  Copyright (c) 2026 ZeroTzyID  -  https://github.com/zerotzyid
-#
-#  Portions derived from the original Jexactyl installation script
-#  (c) 2022 Vikas Dongre, distributed under the MIT License.
+#  All rights reserved.
 # ==============================================================================
 
 SCRIPT_VERSION="2.0.0"
@@ -31,6 +29,15 @@ LOC_LONG="ZeroTzyID Default Location"
 
 MODE=""
 ASSUME_YES=0
+AUTO_DEF=0
+AUTO=0
+FORCE=0
+DNS_WAIT=120
+STATUS_FILE="/var/log/zerotzyid-status.json"
+REPORT="/root/zerotzyid-error.txt"
+CUR_STEP_LABEL=""
+REMOTE_SPECS=()
+PLAIN=0
 HARDEN=0
 PANEL_FQDN=""
 NODE_FQDN=""
@@ -55,6 +62,12 @@ R=$'\e[0m'; B=$'\e[1m'; DIM=$'\e[2m'
 PUR=$'\e[38;5;141m'; CYA=$'\e[38;5;87m'; GRN=$'\e[38;5;84m'
 RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m'; GRY=$'\e[38;5;245m'
 
+setup_ui(){
+    if [ "$AUTO" = 1 ] || [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ]; then
+        R=""; B=""; DIM=""; PUR=""; CYA=""; GRN=""; RED=""; YEL=""; GRY=""
+    fi
+}
+
 # ------------------------------------------------------------------- UI -------
 rep(){ local s="" i; for ((i=0; i<$2; i++)); do s+="$1"; done; printf '%s' "$s"; }
 
@@ -62,7 +75,7 @@ ok(){   printf "  ${GRN}✔${R} %s\n" "$*"; }
 info(){ printf "  ${CYA}i${R} %s\n" "$*"; }
 warn(){ printf "  ${YEL}!${R} %s\n" "$*"; }
 err(){  printf "  ${RED}✘${R} %s\n" "$*" >&2; }
-die(){  err "$*"; exit 1; }
+die(){  err "$*"; write_status failed "$*"; emit_result; exit 1; }
 section(){ printf "\n  ${B}${PUR}▌${R} ${B}%s${R}\n" "$1"; }
 
 row(){ # plain_text colored_text
@@ -72,6 +85,7 @@ row(){ # plain_text colored_text
 }
 
 banner(){
+    [ "$PLAIN" = 1 ] && return 0
     [ -t 1 ] && clear
     printf "\n  ${PUR}╭%s╮${R}\n" "$(rep '─' 60)"
     row "" ""
@@ -89,6 +103,10 @@ bar(){ # done total
 
 spinner_start(){ # prefix label progressbar
     local pre="$1" label="$2" pb="$3"
+    if [ "$AUTO" = 1 ] || [ ! -t 1 ]; then
+        printf "  > %s%s ...\n" "$pre" "$label"
+        return 0
+    fi
     (
         f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏); i=0
         while :; do
@@ -105,24 +123,72 @@ spinner_stop(){
         wait "$SPIN_PID" 2>/dev/null
         SPIN_PID=""
     fi
-    printf "\r\e[K"
+    [ "$AUTO" = 1 ] || [ ! -t 1 ] || printf "\r\e[K"
+}
+
+diagnose(){ # human hint based on the log tail
+    local t
+    t=$(tail -n 300 "$LOG" 2>/dev/null)
+    case "$t" in
+        *"conffile prompt"*|*"end of file on stdin"*)
+            echo "A package asked a config question while no terminal was attached. Run: dpkg --configure -a --force-confdef --force-confold && apt-get -f install -y  then start the installer again." ;;
+        *"Could not get lock"*|*"Unable to acquire the dpkg"*|*"Waiting for cache lock"*)
+            echo "Another apt/dpkg process is running. Wait a minute (or reboot the server) and run the installer again." ;;
+        *"dpkg was interrupted"*)
+            echo "Run: dpkg --configure -a --force-confdef --force-confold  then start the installer again." ;;
+        *"Challenge failed"*|*"Timeout during connect"*|*"Connection refused"*)
+            echo "Let's Encrypt could not reach this server. Check the DNS A record (DNS only, no proxy) and that port 80 is open." ;;
+        *"No space left"*)
+            echo "The disk is full. Free some space and run the installer again." ;;
+        *"Temporary failure resolving"*|*"Could not resolve"*)
+            echo "This server has no working DNS/internet. Check /etc/resolv.conf." ;;
+        *) echo "" ;;
+    esac
+}
+
+write_report(){ # causes clean hint
+    {
+        echo "ZeroTzyID installer report - $(date '+%F %T')"
+        echo "Version     : ${SCRIPT_VERSION}"
+        echo "OS          : ${OS_PRETTY:-unknown}"
+        echo "Failed step : ${CUR_STEP_LABEL}"
+        echo
+        echo "[Cause]"
+        echo "$1"
+        echo
+        echo "[Fix]"
+        echo "${3:-no automatic suggestion}"
+        echo
+        echo "[Log tail]"
+        echo "$2"
+    } > "$REPORT" 2>/dev/null
 }
 
 fail_tail(){
-    printf "\n  ${DIM}Last log lines (%s):${R}\n" "$LOG"
-    tail -n 12 "$LOG" 2>/dev/null | sed "s/^/    /"
-    printf "\n"
+    local causes clean hint
+    causes=$(tail -n 400 "$LOG" 2>/dev/null | grep -E '^(E:|dpkg: error|COMMAND FAILED)|rror:|Challenge failed|Could not|denied' | grep -v '^NOTICE' | awk '!seen[$0]++' | tail -n 6)
+    clean=$(tail -n 300 "$LOG" 2>/dev/null | grep -vE '^(NOTICE:|Selecting previously|Preparing to unpack|Unpacking|Get:|Hit:|Reading |Building |\(Reading database|Setting up|Creating config|Processing triggers)' | grep -v '^[[:space:]]*$' | tail -n 10)
+    hint=$(diagnose)
+    write_report "$causes" "$clean" "$hint"
+    printf "\n  ${RED}${B}Why it failed${R}\n"
+    [ -n "$causes" ] && printf '%s\n' "$causes" | sed 's/^/    /'
+    [ -n "$hint" ] && printf "\n  ${YEL}Fix:${R} %s\n" "$hint"
+    printf "\n  ${GRY}----- Copy this text when asking for help -----${R}\n"
+    cat "$REPORT" 2>/dev/null
+    printf "  ${GRY}----- End (saved to %s, full log: %s) -----${R}\n\n" "$REPORT" "$LOG"
 }
 
 run_step(){ # label function [args]
     local label="$1" pre="" pb="" t0=$SECONDS rc
     shift
+    CUR_STEP_LABEL="$label"
     STEP_NOW=$((STEP_NOW + 1))
     if [ "$STEP_TOTAL" -gt 0 ]; then
         pre="[$STEP_NOW/$STEP_TOTAL] "
         pb="$(bar $((STEP_NOW - 1)) "$STEP_TOTAL")"
     fi
     echo "=== STEP ${pre}${label} ($(date '+%F %T'))" >> "$LOG"
+    write_status running
     spinner_start "$pre" "$label" "$pb"
     "$@" >> "$LOG" 2>&1 < /dev/null
     rc=$?
@@ -132,6 +198,7 @@ run_step(){ # label function [args]
     else
         printf "  ${RED}✘${R} ${GRY}%s${R}%s\n" "$pre" "$label"
         fail_tail
+        write_status failed "Step failed: ${label}"
     fi
     return $rc
 }
@@ -166,6 +233,12 @@ ask(){ # var "Label" [default] [validator]
         fi
         warn "Invalid value for $label: $val"
     fi
+    if [ "$AUTO_DEF" = 1 ] && [ -n "$def" ] && { [ -z "$validator" ] || "$validator" "$def"; }; then
+        printf -v "$var" '%s' "$def"
+        ok "$label: ${B}${def}${R} ${GRY}(auto)${R}"
+        return 0
+    fi
+    [ "$AUTO" = 1 ] && die "Missing or invalid value for: ${label} (pass it as a CLI flag)"
     while true; do
         if [ -n "$def" ]; then
             printf "  ${PUR}❯${R} %s ${GRY}[%s]${R}: " "$label" "$def"
@@ -185,6 +258,7 @@ ask_secret(){ # var "Label" [validator]
     local var="$1" label="$2" validator="${3:-}" val
     val="${!var:-}"
     [ -n "$val" ] && return 0
+    [ "$AUTO" = 1 ] && die "Missing required secret: ${label} (pass it as a CLI flag)"
     while true; do
         printf "  ${PUR}❯${R} %s: " "$label"
         IFS= read -rs val < /dev/tty || die "No terminal available for input."
@@ -257,6 +331,7 @@ is_ports(){
     [ "$s" -ge 1024 ] && [ "$e" -le 65535 ] && [ "$s" -le "$e" ] && [ $((e - s)) -lt 1000 ]
 }
 
+default_email(){ local d="${1#*.}"; [[ "$d" == *.* ]] || d="$1"; echo "admin@${d}"; }
 version_ge(){ [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$2" ]; }
 rand_str(){ tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c "${1:-24}"; }
 resolve_ip(){ dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1; }
@@ -269,13 +344,19 @@ public_ip(){
 sql(){ mysql -N -B "$DB_NAME" -e "$1"; }
 
 dns_check(){ # fqdn expected_ip label
-    local fqdn="$1" want="$2" label="$3" got a
+    local fqdn="$1" want="$2" label="$3" got a waited=0
     while true; do
         got=$(resolve_ip "$fqdn")
         if [ -n "$got" ] && [ "$got" = "$want" ]; then ok "DNS ${label}: ${fqdn} -> ${got}"; return 0; fi
         warn "DNS ${label}: ${fqdn} resolves to '${got:-nothing}', expected ${want}"
         info "Create an A record for ${fqdn} pointing to ${want} (Cloudflare: DNS only / grey cloud)."
-        [ "$ASSUME_YES" = 1 ] && return 1
+        [ "$PLAIN" = 1 ] && printf 'ZT_ERROR|dns|%s|%s|%s\n' "$fqdn" "${got:-none}" "$want"
+        if [ "$ASSUME_YES" = 1 ] || [ "$AUTO" = 1 ]; then
+            waited=$((waited + 10))
+            [ "$waited" -gt "$DNS_WAIT" ] && return 1
+            sleep 10
+            continue
+        fi
         printf "  ${YEL}?${R} [R]etry, [C]ontinue anyway, [Q]uit: "
         IFS= read -r a < /dev/tty || a="q"
         case "${a,,}" in c) return 0 ;; q) exit 1 ;; esac
@@ -321,7 +402,23 @@ preflight(){
     ok "Resources: $(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo) MB RAM, $(df -Pm / | awk 'NR==2 {print $4}') MB free disk"
 }
 
+apt_prepare(){
+    cat > /etc/apt/apt.conf.d/99zerotzyid <<'APTCONF'
+Dpkg::Options { "--force-confdef"; "--force-confold"; };
+DPkg::Lock::Timeout "300";
+APT::Get::Assume-Yes "true";
+APTCONF
+    export UCF_FORCE_CONFFOLD=1
+}
+
+recover_dpkg(){
+    dpkg --configure -a --force-confdef --force-confold
+    apt-get -f install -y
+}
+
 step_base_tools(){
+    apt_prepare
+    recover_dpkg || true
     req apt-get update -y || return 1
     req apt-get install -y software-properties-common curl wget dnsutils virt-what ca-certificates \
         gnupg lsb-release jq acl sudo unzip tar || return 1
@@ -360,13 +457,23 @@ step_repos(){
         req curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/deb.sury.org-php.gpg || return 1
         echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
     fi
-    curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash || echo "MariaDB repo setup failed, using distribution MariaDB."
+    if dpkg -s mariadb-server >/dev/null 2>&1; then
+        echo "MariaDB is already installed, keeping the current repository."
+    else
+        curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | bash -s -- --mariadb-server-version="mariadb-10.11" \
+            || echo "MariaDB repo setup failed, using distribution MariaDB."
+    fi
     req apt-get update -y
 }
 
 step_packages(){
-    req apt-get install -y "php${PHP_VERSION}" php${PHP_VERSION}-{cli,gd,mysql,pdo,mbstring,tokenizer,bcmath,xml,fpm,curl,zip} \
-        mariadb-server nginx tar unzip git redis-server cron acl certbot jq ufw fail2ban dnsutils || return 1
+    local pk=("php${PHP_VERSION}" php${PHP_VERSION}-{cli,gd,mysql,pdo,mbstring,tokenizer,bcmath,xml,fpm,curl,zip} \
+        mariadb-server nginx tar unzip git redis-server cron acl certbot jq ufw fail2ban dnsutils)
+    if ! req apt-get install -y "${pk[@]}"; then
+        echo "Package install failed, running automatic recovery and retrying once..."
+        recover_dpkg
+        req apt-get install -y "${pk[@]}" || return 1
+    fi
     if [ "$F2B_BACKEND" = systemd ]; then apt-get install -y python3-systemd || true; fi
     systemctl enable --now redis-server "php${PHP_VERSION}-fpm" cron mariadb nginx || return 1
     return 0
@@ -816,17 +923,22 @@ rsh(){
 
 collect_remote_node(){ # fills CUR_* ; returns 1 on failure
     local rip rres
-    CUR_FQDN=""; CUR_SSH_HOST=""; CUR_SSH_PORT=""; CUR_SSH_USER=""; CUR_SSH_PASS=""; CUR_SSH_KEY=""
+    [ "${1:-}" = preset ] || { CUR_FQDN=""; CUR_SSH_HOST=""; CUR_SSH_PORT=""; CUR_SSH_USER=""; CUR_SSH_PASS=""; CUR_SSH_KEY=""; }
     ask CUR_FQDN "Node FQDN (e.g. node2.example.com)" "" is_fqdn
     ask CUR_SSH_HOST "SSH host/IP of that server" "$CUR_FQDN"
     ask CUR_SSH_PORT "SSH port" "22"
     ask CUR_SSH_USER "SSH user (must be root)" "root"
-    menu "SSH authentication" "1  Password" "2  Private key file"
-    if [ "$MENU_SEL" -eq 0 ]; then
-        ask_secret CUR_SSH_PASS "SSH password"
+    if [ -z "$CUR_SSH_PASS" ] && [ -z "$CUR_SSH_KEY" ]; then
+        menu "SSH authentication" "1  Password" "2  Private key file"
+        if [ "$MENU_SEL" -eq 0 ]; then
+            ask_secret CUR_SSH_PASS "SSH password"
+        else
+            ask CUR_SSH_KEY "Path to private key" "/root/.ssh/id_rsa"
+        fi
+    fi
+    if [ -n "$CUR_SSH_PASS" ]; then
         command -v sshpass >/dev/null || { info "Installing sshpass..."; apt-get install -y sshpass >> "$LOG" 2>&1; }
     else
-        ask CUR_SSH_KEY "Path to private key" "/root/.ssh/id_rsa"
         [ -r "$CUR_SSH_KEY" ] || { err "Key file not readable: $CUR_SSH_KEY"; return 1; }
     fi
     info "Connecting to ${CUR_SSH_USER}@${CUR_SSH_HOST}:${CUR_SSH_PORT} ..."
@@ -947,6 +1059,84 @@ step_api_start(){
     return 1
 }
 
+# ------------------------------------------------ bot / automation helpers ----
+write_status(){ # state [detail]
+    [ "$1" = failed ] && [ "$AUTO" = 1 ] && printf 'ZT_ERROR|failed|%s|%s\n' "$CUR_STEP_LABEL" "${2:-}"
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -n --arg state "$1" --arg detail "${2:-}" --arg step "$CUR_STEP_LABEL" \
+        --argjson n "${STEP_NOW:-0}" --argjson t "${STEP_TOTAL:-0}" --arg ts "$(date -Is)" \
+        '{state:$state,detail:$detail,step:$step,step_now:$n,step_total:$t,updated:$ts}' \
+        > "${STATUS_FILE}.tmp" 2>/dev/null && mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE" && chmod 600 "$STATUS_FILE"
+    return 0
+}
+
+write_final(){
+    command -v jq >/dev/null 2>&1 || return 0
+    local nodes="[]" objs="" r f i st d state="done"
+    for r in "${NODE_RESULTS[@]}"; do
+        IFS='|' read -r f i st d <<< "$r"
+        [ "$st" = ok ] || state="done_with_errors"
+        objs+="$(jq -nc --arg f "$f" --arg i "$i" --arg s "$st" --arg d "$d" '{fqdn:$f,id:$i,status:$s,detail:$d}')"$'\n'
+    done
+    [ -n "$objs" ] && nodes=$(printf '%s' "$objs" | jq -sc '.')
+    jq -n --arg state "$state" --arg ts "$(date -Is)" --arg url "${PANEL_FQDN:+https://$PANEL_FQDN}" \
+        --arg email "$EMAIL" --arg user "$ADMIN_USER" --arg pass "$ADMIN_PASS" --argjson nodes "$nodes" \
+        '{state:$state,step:"Finished",updated:$ts,panel:{url:$url,email:$email,username:$user,password:$pass},nodes:$nodes}' \
+        > "${STATUS_FILE}.tmp" 2>/dev/null && mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE" && chmod 600 "$STATUS_FILE"
+    return 0
+}
+
+emit_result(){ # one machine-readable line for bots
+    if [ "$AUTO" = 1 ] && [ -f "$STATUS_FILE" ]; then
+        echo "ZT_RESULT $(tr -d '\n' < "$STATUS_FILE")"
+    fi
+    return 0
+}
+
+existing_check(){
+    local found=""
+    [ -f /var/www/pterodactyl/.env ] && found="/var/www/pterodactyl"
+    systemctl list-unit-files 2>/dev/null | grep -q '^pteroq.service' && found="${found:+$found, }pteroq.service"
+    [ -z "$found" ] && return 0
+    warn "Existing panel files found: ${found}. Installing here may overwrite them."
+    [ "$FORCE" = 1 ] && return 0
+    if [ "$AUTO" = 1 ] || [ "$ASSUME_YES" = 1 ]; then
+        die "Existing panel found (${found}). Use a clean server or add --force."
+    fi
+    confirm "Continue anyway?" n || exit 0
+}
+
+pick_db_name(){
+    local n
+    command -v mysql >/dev/null 2>&1 || return 0
+    n=$(mysql -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}'" 2>/dev/null)
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+        DB_NAME="panel_$(rand_str 5 | tr 'A-Z' 'a-z')"
+        info "Database 'panel' already contains data, using ${DB_NAME} instead."
+    fi
+    return 0
+}
+
+deploy_remote_auto(){ # specs: fqdn,host,port,user,password[,keyfile]
+    local spec
+    for spec in "${REMOTE_SPECS[@]}"; do
+        section "Remote node"
+        CUR_FQDN=""; CUR_SSH_HOST=""; CUR_SSH_PORT=""; CUR_SSH_USER=""; CUR_SSH_PASS=""; CUR_SSH_KEY=""
+        IFS=',' read -r CUR_FQDN CUR_SSH_HOST CUR_SSH_PORT CUR_SSH_USER CUR_SSH_PASS CUR_SSH_KEY <<< "$spec"
+        CUR_SSH_HOST="${CUR_SSH_HOST:-$CUR_FQDN}"; CUR_SSH_PORT="${CUR_SSH_PORT:-22}"; CUR_SSH_USER="${CUR_SSH_USER:-root}"
+        NODE_ID=""; NODE_ERR=""
+        if collect_remote_node preset; then
+            run_node_flow \
+                "Creating node, location & allocations in panel|step_node_create_remote" \
+                "Installing Docker, Wings & SSL on ${CUR_FQDN}|step_wings_install_remote" \
+                "Uploading node configuration|step_remote_config" \
+                "Starting Wings & waiting for green node|step_node_start_remote"
+        else
+            node_result "${CUR_FQDN:-unknown}" "-" fail "SSH/DNS check failed for ${CUR_SSH_HOST}"
+        fi
+    done
+}
+
 # ----------------------------------------------------------- summary ---------
 save_credentials(){
     umask 077
@@ -962,6 +1152,15 @@ EOF
 
 summary(){
     local r fqdn id st det
+    if [ "$PLAIN" = 1 ]; then
+        [ -n "$ADMIN_PASS" ] && [ -f "$CRED_FILE" ] && printf 'ZT_PANEL|https://%s|%s|%s|%s\n' "$PANEL_FQDN" "$EMAIL" "$ADMIN_USER" "$ADMIN_PASS"
+        for r in "${NODE_RESULTS[@]}"; do printf 'ZT_NODE|%s\n' "$r"; done
+        printf 'ZT_DONE\n'
+        rm -f /etc/apt/apt.conf.d/99zerotzyid
+        write_final
+        emit_result
+        return 0
+    fi
     section "Done"
     printf "\n  ${PUR}╭%s╮${R}\n" "$(rep '─' 60)"
     if [ -n "$ADMIN_PASS" ] && [ -n "$PANEL_FQDN" ] && [ -f "$CRED_FILE" ]; then
@@ -990,6 +1189,27 @@ summary(){
     printf "  ${PUR}│${R} ${GRY}Need 3306 open for Database Hosts? Run: ufw allow 3306/tcp${R}\n"
     printf "  ${PUR}╰%s╯${R}\n\n" "$(rep '─' 60)"
     printf "  ${GRY}Made by ${R}${B}${BRAND}${R}${GRY} - ${GITHUB}${R}\n\n"
+    copy_block
+    rm -f /etc/apt/apt.conf.d/99zerotzyid
+    write_final
+    emit_result
+}
+
+copy_block(){
+    local r f i st d
+    printf "  ${GRY}----- Salin teks di bawah -----${R}\n"
+    if [ -n "$ADMIN_PASS" ] && [ -f "$CRED_FILE" ]; then
+        echo "Panel    : https://${PANEL_FQDN}"
+        echo "Email    : ${EMAIL}"
+        echo "Username : ${ADMIN_USER}"
+        echo "Password : ${ADMIN_PASS}"
+    fi
+    for r in "${NODE_RESULTS[@]}"; do
+        IFS='|' read -r f i st d <<< "$r"
+        if [ "$st" = ok ]; then echo "Node     : ${f} (ID ${i}) - hijau, siap dipakai"
+        else echo "Node     : ${f} - GAGAL: ${d}"; fi
+    done
+    printf "  ${GRY}----- Selesai -----${R}\n\n"
 }
 
 # ------------------------------------------------------------ modes ----------
@@ -997,8 +1217,8 @@ panel_exists(){ [ -f "$PANEL_DIR/.env" ]; }
 
 collect_panel_inputs(){
     section "Panel details"
-    ask EMAIL "Admin email (also used for Let's Encrypt)" "" is_email
     ask PANEL_FQDN "Panel FQDN (panel.example.com)" "" is_fqdn
+    ask EMAIL "Admin email (also used for Let's Encrypt)" "$(default_email "$PANEL_FQDN")" is_email
     ask ADMIN_USER "Admin username" "admin" is_user
     [ -z "$ADMIN_PASS" ] && ADMIN_PASS="$(rand_str 20)"
     DB_PASS="$(rand_str 32)"
@@ -1032,10 +1252,27 @@ panel_flow_items(){
     if [ "$HARDEN" = 1 ]; then FLOW_PANEL+=("Applying kernel hardening|step_harden"); fi
 }
 
+plan_card(){
+    printf "\n  ${PUR}╭%s╮${R}\n" "$(rep '─' 60)"
+    printf "  ${PUR}│${R} ${B}Install plan${R}\n"
+    printf "  ${PUR}│${R}   Panel   ${CYA}https://%s${R}\n" "$PANEL_FQDN"
+    printf "  ${PUR}│${R}   Node    ${CYA}https://%s:8080${R}\n" "$NODE_FQDN"
+    printf "  ${PUR}│${R}   Admin   %s (%s)\n" "$ADMIN_USER" "$EMAIL"
+    printf "  ${PUR}│${R}   Ports   %s\n" "$PORT_RANGE"
+    printf "  ${PUR}│${R}   Server  %s\n" "$PUB_IP"
+    printf "  ${PUR}╰%s╯${R}\n\n" "$(rep '─' 60)"
+    confirm "Start installation?" y || exit 0
+}
+
 mode_full(){
     panel_exists && die "Jexactyl already exists in ${PANEL_DIR}. Use 'Add remote node' or the upgrade options."
+    existing_check
+    AUTO_DEF=1
+    info "Quick mode: only the panel & node FQDN are needed, everything else is automatic."
     collect_panel_inputs
     collect_node_inputs
+    pick_db_name
+    plan_card
     section "Installing"
     panel_flow_items
     run_flow "${FLOW_PANEL[@]}" || die "Panel installation failed. See ${LOG}"
@@ -1046,7 +1283,10 @@ mode_full(){
         "Installing Docker, Wings & node SSL|step_wings_install_local" \
         "Starting Wings & waiting for green node|step_node_start_local"
     run_flow "Finalizing permissions|step_finalize"
-    if confirm "Also add remote node(s) over SSH?" n; then
+    if [ ${#REMOTE_SPECS[@]} -gt 0 ]; then
+        deploy_remote_auto
+        run_flow "Finalizing permissions|step_finalize"
+    elif confirm "Also add remote node(s) over SSH?" n; then
         deploy_remote_nodes
         run_flow "Finalizing permissions|step_finalize"
     fi
@@ -1055,7 +1295,9 @@ mode_full(){
 
 mode_panel_only(){
     panel_exists && die "Jexactyl already exists in ${PANEL_DIR}."
+    existing_check
     collect_panel_inputs
+    pick_db_name
     section "Installing"
     panel_flow_items
     FLOW_PANEL+=("Finalizing permissions|step_finalize")
@@ -1069,7 +1311,7 @@ mode_node_api(){
     ask PANEL_FQDN "Panel FQDN (already installed)" "" is_fqdn
     info "Create an Application API key in the panel: Admin > Application API (Read & Write for Nodes, Locations, Allocations)."
     ask_secret API_KEY "Application API key (ptla_...)" is_apikey
-    ask EMAIL "Email for Let's Encrypt" "" is_email
+    ask EMAIL "Email for Let's Encrypt" "$(default_email "$PANEL_FQDN")" is_email
     section "Node details"
     ask NODE_FQDN "Node FQDN (this server)" "" is_fqdn
     ask PORT_RANGE "Allocation port range" "25565-25600" is_ports
@@ -1089,9 +1331,10 @@ mode_node_api(){
 
 mode_remote(){
     panel_exists || die "No panel found in ${PANEL_DIR}. Run this on the panel server."
-    ask EMAIL "Email for Let's Encrypt" "" is_email
+    [ -n "$PANEL_FQDN" ] || PANEL_FQDN=$(grep -E '^APP_URL=' "$PANEL_DIR/.env" 2>/dev/null | sed -E 's#^APP_URL=https?://##' | tr -d '"/ ')
+    ask EMAIL "Email for Let's Encrypt" "$(default_email "${PANEL_FQDN:-panel.local}")" is_email
     ask PORT_RANGE "Allocation port range" "25565-25600" is_ports
-    deploy_remote_nodes
+    if [ ${#REMOTE_SPECS[@]} -gt 0 ]; then deploy_remote_auto; else deploy_remote_nodes; fi
     run_flow "Finalizing permissions|step_finalize"
     summary
 }
@@ -1187,12 +1430,28 @@ Usage: bash install.sh [options]
   --admin-user NAME    Admin username (default: admin)
   --admin-pass PASS    Admin password (default: random)
   --ports RANGE        Allocation port range (default: 25565-25600)
+  --node-only          Install Wings only and auto-register to an existing panel
+  --panel FQDN         (with --node-only: the existing panel) 
+  --api-key KEY        Application API key (ptla_...) for --node-only
+  --plain              Machine-readable output (for bots), implies -y
   --harden             Apply extra kernel hardening (optional)
+  --remote SPEC        Remote node over SSH, repeatable:  fqdn,host,port,user,password[,keyfile]
+  --auto, --bot        No prompts, no colors, status in ${STATUS_FILE} (for Telegram bots / scripts)
+  --force              Continue even if another panel is already on this server
+  --dns-wait SEC       Seconds to wait for DNS to propagate in --auto mode (default 120)
   -y, --yes            Accept defaults, no confirmation prompts
   -h, --help           Show this help
 
 Fully automatic example:
   bash install.sh --full --panel panel.example.com --node node.example.com --email you@example.com -y
+
+Telegram bot / script (no terminal needed):
+  bash install.sh --auto --full --panel panel.example.com --node node.example.com
+  progress : cat ${STATUS_FILE}
+  result   : last output line starting with ZT_RESULT (JSON, contains panel login + node status)
+
+Minimal (email defaults to admin@<domain>):
+  bash install.sh --full --panel panel.example.com --node node.example.com -y
 EOF
 }
 
@@ -1207,8 +1466,15 @@ parse_args(){
             --admin-user) ADMIN_USER="${2:-}"; shift ;;
             --admin-pass) ADMIN_PASS="${2:-}"; shift ;;
             --ports) PORT_RANGE="${2:-}"; shift ;;
+            --node-only) MODE=3 ;;
+            --api-key) API_KEY="${2:-}"; shift ;;
+            --plain) PLAIN=1; AUTO=1; AUTO_DEF=1; ASSUME_YES=1 ;;
             --harden) HARDEN=1 ;;
-            -y|--yes) ASSUME_YES=1 ;;
+            --auto|--bot) AUTO=1 ;;
+            --force) FORCE=1 ;;
+            --remote) REMOTE_SPECS+=("${2:-}"); shift ;;
+            --dns-wait) DNS_WAIT="${2:-120}"; shift ;;
+            -y|--yes) ASSUME_YES=1; AUTO_DEF=1 ;;
             -h|--help) usage; exit 0 ;;
             *) err "Unknown option: $1"; usage; exit 1 ;;
         esac
@@ -1218,6 +1484,16 @@ parse_args(){
 
 main(){
     parse_args "$@"
+    if [ "$AUTO" != 1 ] && [ ! -t 0 ] && ! { : < /dev/tty; } 2>/dev/null; then AUTO=1; fi
+    if [ "$AUTO" = 1 ]; then ASSUME_YES=1; AUTO_DEF=1; fi
+    setup_ui
+    if [ "$AUTO" = 1 ] && [ -z "$MODE" ]; then
+        if [ -n "$PANEL_FQDN" ] && [ -n "$NODE_FQDN" ]; then MODE=1
+        elif [ -n "$PANEL_FQDN" ]; then MODE=2
+        elif [ ${#REMOTE_SPECS[@]} -gt 0 ]; then MODE=4
+        else usage; die "Auto mode needs at least --panel (and --node for a full install)."
+        fi
+    fi
     banner
     preflight
     run_step "Preparing system (base tools)" step_base_tools || die "Could not prepare the system. See ${LOG}"
