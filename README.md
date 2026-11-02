@@ -31,7 +31,7 @@ Made by **ZeroTzyID** · [github.com/zerotzyid](https://github.com/zerotzyid)
 ## Quick start (interactive)
 
 ```bash
-bash install.sh
+bash <(curl -s https://raw.githubusercontent.com/zerotzyid/Jexactyl-auto-installer/refs/heads/main/install.sh)
 ```
 
 Choose **1 - Full install**, then enter your own:
@@ -54,7 +54,7 @@ bash install.sh --full --panel panel.example.com --node node.example.com -y
 With your own details:
 
 ```bash
-bash install.sh --full \
+bash <(curl -s https://raw.githubusercontent.com/zerotzyid/Jexactyl-auto-installer/refs/heads/main/install.sh) --full \
   --panel panel.example.com --node node.example.com \
   --email you@gmail.com --admin-user myadmin --ports 25565-25600 -y
 ```
