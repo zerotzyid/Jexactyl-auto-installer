@@ -22,7 +22,7 @@ CRED_FILE="/root/jexactyl-credentials.txt"
 
 PANEL_VER="latest"
 WINGS_VER="latest"
-PHP_VERSION="8.1"
+PHP_VERSION="8.4"
 F2B_BACKEND="auto"
 LOC_SHORT="zerotzyid"
 LOC_LONG="ZeroTzyID Default Location"
@@ -138,6 +138,8 @@ diagnose(){ # human hint based on the end of the current step's log
     case "$t" in
         *"Job for nginx.service failed"*|*"nginx: [emerg]"*|*"nginx.service failed"*)
             echo "Nginx could not start. Usually another web server (Apache) or program already uses port 80/443, or the nginx config is invalid. Check: ss -ltnp | grep -E ':(80|443) '  and  nginx -t" ;;
+        *"require a PHP version"*|*"platform_check"*)
+            echo "The panel needs a newer PHP than the 'php' command uses. Run: update-alternatives --set php /usr/bin/php8.4  then start the installer again." ;;
         *"Job for mariadb.service failed"*|*"mariadb.service failed"*)
             echo "MariaDB could not start (often a failed upgrade of an older database). Check: journalctl -xeu mariadb | tail -n 30" ;;
         *"conffile prompt"*|*"end of file on stdin"*)
@@ -457,7 +459,32 @@ virt_check(){
 }
 
 # --------------------------------------------------------- panel steps --------
+detect_php_version(){
+    local url tmp req v
+    if [ "$PANEL_VER" = latest ]; then
+        url="https://github.com/jexactyl/jexactyl/releases/latest/download/panel.tar.gz"
+    else
+        url="https://github.com/jexactyl/jexactyl/releases/download/${PANEL_VER}/panel.tar.gz"
+    fi
+    tmp="$WORK/probe"; mkdir -p "$tmp"
+    if curl -fsSL --max-time 120 -o "$tmp/panel.tar.gz" "$url" && tar -xzf "$tmp/panel.tar.gz" -C "$tmp" composer.json 2>/dev/null; then
+        req=$(jq -r '.require.php // empty' "$tmp/composer.json" 2>/dev/null)
+        v=$(printf '%s' "$req" | grep -oE '8\.[0-9]+' | sort -V | head -n1)
+        if [ -n "$v" ]; then
+            PHP_VERSION="$v"
+            echo "Panel requires PHP '${req}', using PHP ${PHP_VERSION}."
+        else
+            echo "Could not read the PHP requirement, using PHP ${PHP_VERSION}."
+        fi
+    else
+        echo "Could not download the panel to check its PHP requirement, using PHP ${PHP_VERSION}."
+    fi
+    rm -rf "$tmp"
+    return 0
+}
+
 step_repos(){
+    detect_php_version
     req apt-get update -y || return 1
     req apt-get install -y software-properties-common curl apt-transport-https ca-certificates gnupg lsb-release wget sudo || return 1
     if [ "$lsb_dist" = ubuntu ]; then
@@ -498,7 +525,7 @@ nginx_diag(){
 
 step_packages(){
     free_ports
-    local pk=("php${PHP_VERSION}" php${PHP_VERSION}-{cli,gd,mysql,pdo,mbstring,tokenizer,bcmath,xml,fpm,curl,zip} \
+    local pk=("php${PHP_VERSION}" php${PHP_VERSION}-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip} \
         mariadb-server nginx tar unzip git redis-server cron acl certbot jq ufw fail2ban dnsutils)
     if ! req apt-get install -y "${pk[@]}"; then
         echo "Package install failed, running automatic recovery and retrying once..."
@@ -506,6 +533,12 @@ step_packages(){
         req apt-get install -y "${pk[@]}" || return 1
     fi
     if [ "$F2B_BACKEND" = systemd ]; then apt-get install -y python3-systemd || true; fi
+    update-alternatives --set php "/usr/bin/php${PHP_VERSION}" 2>/dev/null || true
+    update-alternatives --set phar "/usr/bin/phar${PHP_VERSION}" 2>/dev/null || true
+    if [ "$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)" != "$PHP_VERSION" ]; then
+        echo "The 'php' command is not PHP ${PHP_VERSION} (found: $(php -v 2>/dev/null | head -n1))."
+        return 1
+    fi
     systemctl enable --now redis-server "php${PHP_VERSION}-fpm" cron || return 1
     systemctl enable --now mariadb || { journalctl -u mariadb -n 25 --no-pager; return 1; }
     free_ports
