@@ -5,7 +5,7 @@
 #  All rights reserved.
 # ==============================================================================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.1.0"
 BRAND="ZeroTzyID"
 GITHUB="github.com/zerotzyid"
 
@@ -32,6 +32,7 @@ ASSUME_YES=0
 AUTO_DEF=0
 AUTO=0
 FORCE=0
+REINSTALL=0
 DNS_WAIT=120
 STATUS_FILE="/var/log/zerotzyid-status.json"
 REPORT="/root/zerotzyid-error.txt"
@@ -753,9 +754,12 @@ write_php_helpers(){
 require '/var/www/jexactyl/vendor/autoload.php';
 $app = require '/var/www/jexactyl/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+$ns = class_exists('Everest\\Models\\Node') ? 'Everest' : 'Pterodactyl';
 try {
-    $node = Pterodactyl\Models\Node::findOrFail((int) $argv[1]);
-    $info = app(Pterodactyl\Repositories\Wings\DaemonConfigurationRepository::class)->setNode($node)->getSystemInformation();
+    $nodeClass = $ns . '\\Models\\Node';
+    $repoClass = $ns . '\\Repositories\\Wings\\DaemonConfigurationRepository';
+    $node = $nodeClass::findOrFail((int) $argv[1]);
+    $info = app($repoClass)->setNode($node)->getSystemInformation();
     echo 'wings ' . ($info['version'] ?? 'online');
     exit(0);
 } catch (Throwable $e) {
@@ -768,17 +772,20 @@ PHP
 require '/var/www/jexactyl/vendor/autoload.php';
 $app = require '/var/www/jexactyl/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
-echo Pterodactyl\Models\Node::findOrFail((int) $argv[1])->getYamlConfiguration();
+$ns = class_exists('Everest\\Models\\Node') ? 'Everest' : 'Pterodactyl';
+$nodeClass = $ns . '\\Models\\Node';
+echo $nodeClass::findOrFail((int) $argv[1])->getYamlConfiguration();
 PHP
     cat > "$WORK/create_node.php" <<'PHP'
 <?php
 require '/var/www/jexactyl/vendor/autoload.php';
 $app = require '/var/www/jexactyl/bootstrap/app.php';
 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
-$node = app(Pterodactyl\Services\Nodes\NodeCreationService::class)->handle([
+$ns = class_exists('Everest\\Models\\Node') ? 'Everest' : 'Pterodactyl';
+$serviceClass = $ns . '\\Services\\Nodes\\NodeCreationService';
+$data = [
     'name' => getenv('ZT_NAME'),
     'description' => 'Auto-created by ZeroTzyID installer',
-    'location_id' => (int) getenv('ZT_LOC'),
     'fqdn' => getenv('ZT_FQDN'),
     'scheme' => 'https',
     'behind_proxy' => false,
@@ -789,10 +796,19 @@ $node = app(Pterodactyl\Services\Nodes\NodeCreationService::class)->handle([
     'disk' => (int) getenv('ZT_DISK'),
     'disk_overallocate' => 0,
     'upload_size' => 100,
-    'daemonBase' => '/var/lib/pterodactyl/volumes',
-    'daemonSFTP' => 2022,
+    'daemon_base' => '/var/lib/pterodactyl/volumes',
+    'listen_port_http' => 8080,
+    'listen_port_sftp' => 2022,
+    'public_port_http' => 8080,
+    'public_port_sftp' => 2022,
     'daemonListen' => 8080,
-]);
+    'daemonSFTP' => 2022,
+    'daemonBase' => '/var/lib/pterodactyl/volumes',
+];
+if (getenv('ZT_LOC') !== false && getenv('ZT_LOC') !== '') {
+    $data['location_id'] = (int) getenv('ZT_LOC');
+}
+$node = app($serviceClass)->handle($data);
 echo $node->id;
 PHP
 }
@@ -832,20 +848,26 @@ fetch_node_config(){ # node_id
 }
 
 provision_node(){ # fqdn ip  (uses NODE_MEM / NODE_DISK) -> NODE_ID + config file
-    local fqdn="$1" ip="$2" loc_id name
+    local fqdn="$1" ip="$2" loc_id="" name
+    local -a loc_args=()
     name="ZT-${fqdn%%.*}"
     cd "$PANEL_DIR" || return 1
     write_php_helpers
-    loc_id=$(sql "SELECT id FROM locations WHERE short='${LOC_SHORT}' LIMIT 1")
-    if [ -z "$loc_id" ]; then
-        req php artisan p:location:make --no-interaction --short="$LOC_SHORT" --long="$LOC_LONG" || return 1
+    if php artisan list --raw 2>/dev/null | grep -q '^p:location:make'; then
         loc_id=$(sql "SELECT id FROM locations WHERE short='${LOC_SHORT}' LIMIT 1")
+        if [ -z "$loc_id" ]; then
+            req php artisan p:location:make --no-interaction --short="$LOC_SHORT" --long="$LOC_LONG" || return 1
+            loc_id=$(sql "SELECT id FROM locations WHERE short='${LOC_SHORT}' LIMIT 1")
+        fi
+        [ -n "$loc_id" ] || { echo "Location could not be created."; return 1; }
+        loc_args=(--locationId="$loc_id")
+    else
+        echo "This panel version has no locations, skipping location setup."
     fi
-    [ -n "$loc_id" ] || { echo "Location could not be created."; return 1; }
     NODE_ID=$(sql "SELECT id FROM nodes WHERE fqdn='${fqdn}' ORDER BY id DESC LIMIT 1")
     if [ -z "$NODE_ID" ]; then
         php artisan p:node:make --no-interaction --name="$name" --description="Auto-created by ZeroTzyID installer" \
-            --locationId="$loc_id" --fqdn="$fqdn" --public=1 --scheme=https --proxy=0 --maintenance=0 \
+            "${loc_args[@]}" --fqdn="$fqdn" --public=1 --scheme=https --proxy=0 --maintenance=0 \
             --maxMemory="$NODE_MEM" --overallocateMemory=0 --maxDisk="$NODE_DISK" --overallocateDisk=0 \
             --uploadSize=100 --daemonListeningPort=8080 --daemonSFTPPort=2022 --daemonBase=/var/lib/pterodactyl/volumes
         NODE_ID=$(sql "SELECT id FROM nodes WHERE fqdn='${fqdn}' ORDER BY id DESC LIMIT 1")
@@ -1086,21 +1108,23 @@ api(){ # method path [json]
 }
 
 step_api_register(){
-    local loc existing body
-    api GET /locations | jq -e '.data' >/dev/null || { echo "API key rejected by the panel."; return 1; }
-    loc=$(api GET /locations | jq -r '.data[0].attributes.id // empty')
-    if [ -z "$loc" ]; then
-        loc=$(api POST /locations "{\"short\":\"${LOC_SHORT}\",\"long\":\"${LOC_LONG}\"}" | jq -r '.attributes.id // empty')
+    local loc="" existing body
+    api GET /nodes | jq -e '.data' >/dev/null || { echo "API key rejected by the panel (or panel unreachable)."; return 1; }
+    if api GET /locations 2>/dev/null | jq -e '.data' >/dev/null 2>&1; then
+        loc=$(api GET /locations | jq -r '.data[0].attributes.id // empty')
+        if [ -z "$loc" ]; then
+            loc=$(api POST /locations "{\"short\":\"${LOC_SHORT}\",\"long\":\"${LOC_LONG}\"}" | jq -r '.attributes.id // empty')
+        fi
     fi
-    [ -n "$loc" ] || { echo "Could not get/create a location."; return 1; }
     calc_res "$(res_script | bash)"
     existing=$(api GET "/nodes?filter[fqdn]=${CUR_FQDN}" | jq -r '.data[0].attributes.id // empty')
     if [ -n "$existing" ]; then
         NODE_ID="$existing"; echo "Node already exists (ID ${NODE_ID}), reusing."
     else
-        body=$(jq -n --arg name "ZT-${CUR_FQDN%%.*}" --arg fqdn "$CUR_FQDN" --argjson loc "$loc" \
+        body=$(jq -n --arg name "ZT-${CUR_FQDN%%.*}" --arg fqdn "$CUR_FQDN" --argjson loc "${loc:-null}" \
             --argjson mem "$NODE_MEM" --argjson disk "$NODE_DISK" \
-            '{name:$name,description:"Auto-created by ZeroTzyID installer",location_id:$loc,fqdn:$fqdn,scheme:"https",behind_proxy:false,public:true,memory:$mem,memory_overallocate:0,disk:$disk,disk_overallocate:0,daemon_base:"/var/lib/pterodactyl/volumes",daemon_sftp:2022,daemon_listen:8080,upload_size:100}')
+            '{name:$name,description:"Auto-created by ZeroTzyID installer",fqdn:$fqdn,scheme:"https",behind_proxy:false,public:true,memory:$mem,memory_overallocate:0,disk:$disk,disk_overallocate:0,daemon_base:"/var/lib/pterodactyl/volumes",upload_size:100,listen_port_http:8080,listen_port_sftp:2022,public_port_http:8080,public_port_sftp:2022,daemon_sftp:2022,daemon_listen:8080}
+             | if $loc != null then .location_id=$loc else . end')
         NODE_ID=$(api POST /nodes "$body" | jq -r '.attributes.id // empty')
     fi
     [ -n "$NODE_ID" ] || { echo "Node creation through the API failed."; return 1; }
@@ -1334,8 +1358,54 @@ plan_card(){
     confirm "Start installation?" y || exit 0
 }
 
+mode_local_node(){ # panel already installed on this server: only create + set up the node
+    section "Panel already installed"
+    PANEL_FQDN=$(grep -E '^APP_URL=' "$PANEL_DIR/.env" 2>/dev/null | sed -E 's#^APP_URL=https?://##' | tr -d '"/ ')
+    DB_NAME=$(grep -E '^DB_DATABASE=' "$PANEL_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
+    DB_NAME="${DB_NAME:-panel}"
+    info "Panel found: ${PANEL_FQDN:-unknown}. Only the node will be created now."
+    ask EMAIL "Email for Let's Encrypt (e.g. yourname@gmail.com)" "$([ "$AUTO_DEF" = 1 ] && default_email "${PANEL_FQDN:-panel.local}")" is_email
+    PUB_IP="$(public_ip)"
+    [ -n "$PUB_IP" ] || die "Could not detect this server's public IP."
+    collect_node_inputs
+    section "Installing"
+    NODE_ID=""; NODE_ERR=""
+    run_node_flow \
+        "Creating node & allocations|step_node_create_local" \
+        "Installing Docker, Wings & node SSL|step_wings_install_local" \
+        "Starting Wings & waiting for green node|step_node_start_local"
+    run_flow "Finalizing permissions|step_finalize"
+    if [ ${#REMOTE_SPECS[@]} -gt 0 ]; then
+        deploy_remote_auto
+        run_flow "Finalizing permissions|step_finalize"
+    fi
+    summary
+}
+
 mode_full(){
-    panel_exists && die "Jexactyl already exists in ${PANEL_DIR}. Use 'Add remote node' or the upgrade options."
+    local decided=0
+    if panel_exists; then
+        if [ "$REINSTALL" = 1 ]; then
+            decided=1
+        elif [ "$ASSUME_YES" = 1 ]; then
+            info "Jexactyl is already installed here: only the node will be created (add --reinstall to delete and install fresh)."
+            mode_local_node
+            return
+        else
+            section "Existing panel found"
+            warn "Jexactyl is already installed in ${PANEL_DIR}."
+            menu "What do you want to do?" \
+                "1  Delete it, then install again" \
+                "2  Keep the panel, only create and set up the node" \
+                "3  Cancel (do not install)"
+            case "$MENU_SEL" in
+                0) decided=1 ;;
+                1) mode_local_node; return ;;
+                *) info "Installation cancelled. Nothing was changed."; exit 0 ;;
+            esac
+        fi
+    fi
+    reinstall_guard both "$decided"
     existing_check
     collect_panel_inputs
     collect_node_inputs
@@ -1362,7 +1432,7 @@ mode_full(){
 }
 
 mode_panel_only(){
-    panel_exists && die "Jexactyl already exists in ${PANEL_DIR}."
+    reinstall_guard panel
     existing_check
     collect_panel_inputs
     pick_db_name
@@ -1375,6 +1445,7 @@ mode_panel_only(){
 }
 
 mode_node_api(){
+    reinstall_guard wings
     section "Existing panel"
     ask PANEL_FQDN "Panel FQDN (already installed)" "" is_fqdn
     info "Create an Application API key in the panel: Admin > Application API (Read & Write for Nodes, Locations, Allocations)."
@@ -1406,6 +1477,166 @@ mode_remote(){
     run_flow "Finalizing permissions|step_finalize"
     summary
 }
+
+# ------------------------------------------------------ delete / clear --------
+wings_exists(){ [ -x /usr/local/bin/wings ] || [ -f /etc/systemd/system/wings.service ] || [ -f /etc/pterodactyl/config.yml ]; }
+
+env_val(){ grep -E "^$1=" "$PANEL_DIR/.env" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '"'; }
+
+existing_kind(){ # what the action needs: panel|wings|both -> prints what really exists: panel|wings|both|none
+    local hp=0 hw=0
+    case "$1" in panel|both) panel_exists && hp=1 ;; esac
+    case "$1" in wings|both) wings_exists && hw=1 ;; esac
+    if [ $hp = 1 ] && [ $hw = 1 ]; then echo both
+    elif [ $hp = 1 ]; then echo panel
+    elif [ $hw = 1 ]; then echo wings
+    else echo none
+    fi
+}
+
+wipe_plan(){ # panel|wings|both
+    local kind="$1" n
+    section "What will be deleted"
+    if [ "$kind" = panel ] || [ "$kind" = both ]; then
+        warn "Panel: ${PANEL_DIR} (all files), database '$(env_val DB_DATABASE)', queue worker (pteroq), cron entry, Nginx site"
+    fi
+    if [ "$kind" = wings ] || [ "$kind" = both ]; then
+        n=$(find /var/lib/pterodactyl/volumes -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+        warn "Wings: service, /usr/local/bin/wings, /etc/pterodactyl, game server containers"
+        warn "Wings: ALL server data in /var/lib/pterodactyl (${n} server folder(s), including backups)"
+    fi
+    info "Kept: Docker, PHP, MariaDB, Nginx packages and SSL certificates (so a new install can reuse them)."
+}
+
+wipe_confirm(){
+    if [ "$ASSUME_YES" = 1 ]; then return 0; fi
+    warn "This cannot be undone."
+    confirm "Delete now?" n
+}
+
+step_wipe_wings(){
+    local ids
+    echo "Stopping Wings..."
+    systemctl stop wings 2>/dev/null
+    systemctl disable wings 2>/dev/null
+    if command -v docker >/dev/null 2>&1; then
+        systemctl is-active --quiet docker || systemctl start docker 2>/dev/null
+        if docker info >/dev/null 2>&1; then
+            ids=$( { docker ps -aq --filter "label=Service=Pterodactyl"; docker ps -aq --filter "network=pterodactyl_nw"; } 2>/dev/null | sort -u)
+            # shellcheck disable=SC2086
+            [ -n "$ids" ] && docker rm -f $ids
+            docker network rm pterodactyl_nw 2>/dev/null
+        else
+            echo "Docker is not responding, game server containers were not removed."
+        fi
+    fi
+    awk '{print $2}' /proc/mounts | grep -E '^/var/lib/pterodactyl' | sort -r | while read -r m; do umount -l "$m" 2>/dev/null; done
+    rm -rf /var/lib/pterodactyl /etc/pterodactyl /var/log/pterodactyl /tmp/pterodactyl /run/wings /var/run/wings
+    rm -f /usr/local/bin/wings /etc/systemd/system/wings.service
+    systemctl daemon-reload
+    systemctl reset-failed wings 2>/dev/null
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw --force delete allow 8080/tcp 2>/dev/null
+        ufw --force delete allow 2022/tcp 2>/dev/null
+    fi
+    return 0
+}
+
+step_wipe_panel(){
+    local db user
+    db="$(env_val DB_DATABASE)"; user="$(env_val DB_USERNAME)"
+    db="${db:-$DB_NAME}"; user="${user:-$DB_USER}"
+    [[ "$db" =~ ^[A-Za-z0-9_]+$ ]] || db=""
+    [[ "$user" =~ ^[A-Za-z0-9_.-]+$ ]] || user=""
+    case "$db" in mysql|information_schema|performance_schema|sys) db="" ;; esac
+    case "$user" in root|mysql|mariadb.sys|PUBLIC) user="" ;; esac
+
+    echo "Stopping queue worker and removing cron..."
+    systemctl stop pteroq 2>/dev/null
+    systemctl disable pteroq 2>/dev/null
+    rm -f /etc/systemd/system/pteroq.service
+    systemctl daemon-reload
+    systemctl reset-failed pteroq 2>/dev/null
+    crontab -l 2>/dev/null | grep -vF "${PANEL_DIR}/artisan schedule:run" | crontab -
+
+    echo "Removing Nginx site..."
+    rm -f /etc/nginx/sites-enabled/jexactyl.conf /etc/nginx/sites-available/jexactyl.conf
+    if command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null; then systemctl reload nginx 2>/dev/null; fi
+
+    if command -v mysql >/dev/null 2>&1; then
+        systemctl is-active --quiet mariadb || systemctl start mariadb 2>/dev/null
+        [ -n "$db" ] && mysql -e "DROP DATABASE IF EXISTS \`${db}\`;"
+        [ -n "$user" ] && mysql -e "DROP USER IF EXISTS '${user}'@'127.0.0.1'; FLUSH PRIVILEGES;"
+    fi
+
+    cd / || true
+    case "$PANEL_DIR" in ""|/|/var|/var/www) echo "Unsafe panel directory '${PANEL_DIR}', not deleting."; return 1 ;; esac
+    rm -rf "$PANEL_DIR"
+    rm -f "$CRED_FILE"
+    return 0
+}
+
+run_wipe(){ # panel|wings|both
+    local kind="$1" items=()
+    section "Deleting"
+    if [ "$kind" = wings ] || [ "$kind" = both ]; then items+=("Removing Wings, game server containers & data|step_wipe_wings"); fi
+    if [ "$kind" = panel ] || [ "$kind" = both ]; then items+=("Removing panel, database, queue worker & Nginx site|step_wipe_panel"); fi
+    run_flow "${items[@]}" || die "Cleanup failed. See ${LOG}"
+    ok "Cleanup finished."
+}
+
+do_wipe(){ # panel|wings|both (only what exists)
+    wipe_plan "$1"
+    wipe_confirm || { info "Cancelled. Nothing was deleted."; exit 0; }
+    run_wipe "$1"
+}
+
+reinstall_guard(){ # needed: panel|wings|both  [decided=1 when the user already chose "delete"]
+    local need="$1" decided="${2:-0}" k name
+    k="$(existing_kind "$need")"
+    [ "$k" = none ] && return 0
+    case "$k" in panel) name="Panel" ;; wings) name="Wings" ;; *) name="Panel and Wings" ;; esac
+    [ "$REINSTALL" = 1 ] && decided=1
+    if [ "$decided" != 1 ]; then
+        section "Existing installation found"
+        warn "${name} already installed on this server."
+        if [ "$ASSUME_YES" = 1 ]; then
+            die "${name} already installed. Add --reinstall to delete it first and install again."
+        fi
+        menu "What do you want to do?" \
+            "1  Delete it, then install again" \
+            "2  Cancel (do not install)"
+        if [ "$MENU_SEL" -ne 0 ]; then info "Installation cancelled. Nothing was changed."; exit 0; fi
+    fi
+    do_wipe "$k"
+}
+
+mode_delete(){ # panel|wings|both
+    local want="$1" k label
+    case "$want" in panel) label="panel" ;; wings) label="Wings" ;; *) label="panel or Wings" ;; esac
+    k="$(existing_kind "$want")"
+    if [ "$k" = none ]; then
+        info "Nothing to delete: no ${label} found on this server."
+        write_status deleted "nothing found"; emit_result
+        return 0
+    fi
+    do_wipe "$k"
+    write_status deleted "Deleted: ${k}"
+    emit_result
+    case "$k" in
+        both)  ok "Panel and Wings deleted. The server is clean." ;;
+        panel) ok "Panel deleted." ;;
+        wings) ok "Wings deleted." ;;
+    esac
+    if [ "$k" = wings ] || [ "$k" = both ]; then
+        info "If this node is still listed in a panel, delete it there (Admin > Nodes)."
+    fi
+    printf "  ${GRY}----- Selesai -----${R}\n\n"
+}
+
+mode_delete_panel(){ mode_delete panel; }
+mode_delete_wings(){ mode_delete wings; }
+mode_delete_all(){   mode_delete both; }
 
 # -------------------------------------------------- upgrades & extras --------
 mode_upgrade_panel(){
@@ -1506,6 +1737,10 @@ Usage: bash install.sh [options]
   --remote SPEC        Remote node over SSH, repeatable:  fqdn,host,port,user,password[,keyfile]
   --auto, --bot        No prompts, no colors, status in ${STATUS_FILE} (for Telegram bots / scripts)
   --force              Continue even if another panel is already on this server
+  --reinstall          If a panel / Wings already exists: delete it first, then install (no prompt)
+  --delete-panel       Delete the panel (files, database, queue worker, cron, Nginx site)
+  --delete-wings       Delete Wings (service, binary, config, game server containers & data)
+  --delete-all, --clear  Delete the panel and Wings (clean server)
   --dns-wait SEC       Seconds to wait for DNS to propagate in --auto mode (default 120)
   -y, --yes            Accept defaults, no confirmation prompts
   -h, --help           Show this help
@@ -1517,6 +1752,12 @@ Telegram bot / script (no terminal needed):
   bash install.sh --auto --full --panel panel.example.com --node node.example.com
   progress : cat ${STATUS_FILE}
   result   : last output line starting with ZT_RESULT (JSON, contains panel login + node status)
+
+Delete / clear:
+  bash install.sh --delete-panel          # panel only
+  bash install.sh --delete-wings          # Wings only
+  bash install.sh --delete-all -y         # both, no confirmation
+  bash install.sh --auto --full --panel panel.example.com --node node.example.com --reinstall
 
 Minimal (email defaults to admin@<domain>):
   bash install.sh --full --panel panel.example.com --node node.example.com -y
@@ -1540,6 +1781,10 @@ parse_args(){
             --harden) HARDEN=1 ;;
             --auto|--bot) AUTO=1 ;;
             --force) FORCE=1 ;;
+            --reinstall) REINSTALL=1 ;;
+            --delete-panel) MODE=10 ;;
+            --delete-wings) MODE=11 ;;
+            --delete-all|--clear) MODE=12 ;;
             --remote) REMOTE_SPECS+=("${2:-}"); shift ;;
             --dns-wait) DNS_WAIT="${2:-120}"; shift ;;
             -y|--yes) ASSUME_YES=1; AUTO_DEF=1 ;;
@@ -1577,9 +1822,12 @@ main(){
             "7  Install phpMyAdmin" \
             "8  Emergency MariaDB root password reset" \
             "9  Emergency database host reset" \
+            "10 Delete Panel (use arrow keys)" \
+            "11 Delete Wings (use arrow keys)" \
+            "12 Delete Panel + Wings / clear server (use arrow keys)" \
             "0  Exit"
         MODE=$((MENU_SEL + 1))
-        [ "$MODE" -eq 10 ] && exit 0
+        [ "$MODE" -eq 13 ] && exit 0
     fi
     case "$MODE" in
         1) mode_full ;;
@@ -1591,6 +1839,9 @@ main(){
         7) mode_phpmyadmin ;;
         8) mode_mariadb_reset ;;
         9) mode_db_host_reset ;;
+        10) mode_delete_panel ;;
+        11) mode_delete_wings ;;
+        12) mode_delete_all ;;
     esac
 }
 
