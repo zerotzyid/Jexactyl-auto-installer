@@ -5,7 +5,7 @@
 #  All rights reserved.
 # ==============================================================================
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.1"
 BRAND="ZeroTzyID"
 GITHUB="github.com/zerotzyid"
 
@@ -149,6 +149,8 @@ diagnose(){ # human hint based on the end of the current step's log
             echo "Another apt/dpkg process is running. Wait a minute (or reboot the server) and run the installer again." ;;
         *"dpkg was interrupted"*)
             echo "Run: dpkg --configure -a --force-confdef --force-confold  then start the installer again." ;;
+        *"Unknown column 'daemon"*)
+            echo "The panel database has different node column names than this installer expected. Update the installer (v2.1.1+) and run it again." ;;
         *"Challenge failed"*|*"Timeout during connect"*|*"Connection refused"*)
             echo "Let's Encrypt could not reach this server. Check the DNS A record (DNS only, no proxy) and that port 80 is open." ;;
         *"No space left"*)
@@ -808,6 +810,9 @@ $data = [
 if (getenv('ZT_LOC') !== false && getenv('ZT_LOC') !== '') {
     $data['location_id'] = (int) getenv('ZT_LOC');
 }
+// Column names differ between panel versions (daemonListen vs listen_port_http, no
+// location_id in newer ones, ...): only send the columns this database really has.
+$data = array_filter($data, fn ($v, $k) => \Illuminate\Support\Facades\Schema::hasColumn('nodes', $k), ARRAY_FILTER_USE_BOTH);
 $node = app($serviceClass)->handle($data);
 echo $node->id;
 PHP
@@ -866,15 +871,15 @@ provision_node(){ # fqdn ip  (uses NODE_MEM / NODE_DISK) -> NODE_ID + config fil
     fi
     NODE_ID=$(sql "SELECT id FROM nodes WHERE fqdn='${fqdn}' ORDER BY id DESC LIMIT 1")
     if [ -z "$NODE_ID" ]; then
-        php artisan p:node:make --no-interaction --name="$name" --description="Auto-created by ZeroTzyID installer" \
-            "${loc_args[@]}" --fqdn="$fqdn" --public=1 --scheme=https --proxy=0 --maintenance=0 \
-            --maxMemory="$NODE_MEM" --overallocateMemory=0 --maxDisk="$NODE_DISK" --overallocateDisk=0 \
-            --uploadSize=100 --daemonListeningPort=8080 --daemonSFTPPort=2022 --daemonBase=/var/lib/pterodactyl/volumes
+        ZT_NAME="$name" ZT_LOC="$loc_id" ZT_FQDN="$fqdn" ZT_MEM="$NODE_MEM" ZT_DISK="$NODE_DISK" \
+            php "$WORK/create_node.php"
         NODE_ID=$(sql "SELECT id FROM nodes WHERE fqdn='${fqdn}' ORDER BY id DESC LIMIT 1")
         if [ -z "$NODE_ID" ]; then
-            echo "p:node:make failed, using direct creation fallback."
-            ZT_NAME="$name" ZT_LOC="$loc_id" ZT_FQDN="$fqdn" ZT_MEM="$NODE_MEM" ZT_DISK="$NODE_DISK" \
-                php "$WORK/create_node.php"
+            echo "Direct creation failed, trying p:node:make..."
+            php artisan p:node:make --no-interaction --name="$name" --description="Auto-created by ZeroTzyID installer" \
+                "${loc_args[@]}" --fqdn="$fqdn" --public=1 --scheme=https --proxy=0 --maintenance=0 \
+                --maxMemory="$NODE_MEM" --overallocateMemory=0 --maxDisk="$NODE_DISK" --overallocateDisk=0 \
+                --uploadSize=100 --daemonListeningPort=8080 --daemonSFTPPort=2022 --daemonBase=/var/lib/pterodactyl/volumes
             NODE_ID=$(sql "SELECT id FROM nodes WHERE fqdn='${fqdn}' ORDER BY id DESC LIMIT 1")
         fi
     else
